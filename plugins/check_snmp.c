@@ -1856,12 +1856,12 @@ char *query_interface_attribute(const char *attr_type, const char *iface_idx, in
 
 	/* Add context args */
 	for (i = 0; i < numcontext; i++) {
-		cmd_line[10 + i] = contextargs[i];
+		cmd_line[10 + i] = strdup(contextargs[i]);
 	}
 
 	/* Add auth/priv args */
 	for (i = 0; i < numauthpriv; i++) {
-		cmd_line[10 + numcontext + i] = authpriv[i];
+		cmd_line[10 + numcontext + i] = strdup(authpriv[i]);
 	}
 
 	/* Add host:port */
@@ -1934,21 +1934,26 @@ cleanup:
 
 /* Resolve db_key based on db_key_type */
 void resolve_db_key(int cmd_interval, int num_retries) {
-	if (check_throughput && interface_idx != NULL) {
-		if (db_key_type != NULL) {
-			if (strcmp(db_key_type, "index") == 0) {
-				db_key = interface_idx;
-			} else {
-				db_key = query_interface_attribute(db_key_type, interface_idx, cmd_interval, num_retries);
-				if (db_key == NULL) {
-					die(STATE_UNKNOWN, _("Failed to query interface %s for %s\n"), db_key_type, interface_idx);
-				}
-				if (verbose) printf("Resolved db_key from %s: %s\n", db_key_type, db_key);
-			}
-		} else {
+	if (db_key_type != NULL) {
+		if (!check_throughput)
+			die(STATE_UNKNOWN, _("--db-key requires --throughput\n"));
+		if (interface_idx == NULL)
+			die(STATE_UNKNOWN, _("--db-key requires --interface (-i)\n"));
+
+		if (strcmp(db_key_type, "index") == 0) {
 			db_key = interface_idx;
+		} else {
+			db_key = query_interface_attribute(db_key_type, interface_idx, cmd_interval, num_retries);
+			if (db_key == NULL)
+				die(STATE_UNKNOWN, _("Failed to query interface %s for %s\n"), db_key_type, interface_idx);
+			if (verbose) printf("Resolved db_key from %s: %s\n", db_key_type, db_key);
 		}
-		
+
+		if (validate_db_key(db_key) != 0)
+			die(STATE_UNKNOWN, _("Invalid database key '%s'\n"), db_key);
+	} else if (check_throughput && interface_idx != NULL) {
+		db_key = interface_idx;
+
 		if (validate_db_key(db_key) != 0)
 			die(STATE_UNKNOWN, _("Invalid database key '%s'\n"), db_key);
 	}
