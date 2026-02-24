@@ -77,6 +77,9 @@ const char *email = "devel@nagios-plugins.org";
 #define L_STATUS CHAR_MAX+9
 #define L_COUNTER_BITS CHAR_MAX+10
 #define L_DB_KEY CHAR_MAX+11
+#define L_DB_PATH CHAR_MAX+12
+#define L_DORMANT CHAR_MAX+13
+#define L_ADMIN_DOWN CHAR_MAX+14
 
 /* Gobble to string - stop incrementing c when c[0] match one of the
  * characters in s */
@@ -173,10 +176,14 @@ char* ip_version = "";
 int check_throughput = 0;
 int check_status = 0;
 char *db_path = NULL;
+char *custom_db_path = NULL;
 char *interface_idx = NULL;
 char *db_key = NULL;
+char *db_key_type = NULL;
 char *status_oid = NULL;
 int explicit_counter_bits = 0;
+int dormant_behavior = STATE_CRITICAL;  /* i=ignore, w=warning, c=critical */
+int admin_down_behavior = STATE_WARNING;  /* i=ignore, w=warning, c=critical */
 
 typedef struct {
 	time_t timestamp;
@@ -187,7 +194,10 @@ typedef struct {
 
 /* Prototypes for throughput helpers */
 const char *determine_db_path(void);
+int db_init(const char *db_path);
 int validate_db_key(const char *key);
+void resolve_db_key(int cmd_interval, int num_retries);
+char *query_interface_attribute(const char *attr_type, const char *iface_idx, int cmd_interval, int num_retries);
 int db_read_state(const char *db_path, const char *host, const char *iface, OctetData *data);
 int db_write_state(const char *db_path, const char *host, const char *iface, const OctetData *data);
 unsigned long long calculate_wraparound(unsigned long long current, unsigned long long previous, int counter_bits);
@@ -282,13 +292,18 @@ main (int argc, char **argv)
 	if (process_arguments (argc, argv) == ERROR)
 		usage4 (_("Could not parse arguments"));
 
-	db_path = (char *)determine_db_path();
+	if (db_path == NULL) {
+		db_path = (char *)determine_db_path();
+	}
 
 	command_interval = timeout_interval / retries + 1;
 	if (command_interval < 1) {
 		usage4 (_("Command timeout must be 1 second or greater. Please increase timeout (-t) value or decrease retries (-e) value."));
 		exit (STATE_UNKNOWN);
 	}
+
+	/* Resolve database key for throughput/status modes */
+	resolve_db_key(command_interval, retries);
 
 	if(calculate_rate && !check_throughput) {
 		if (!strcmp(label, "SNMP"))
@@ -542,7 +557,7 @@ main (int argc, char **argv)
 
 		/* Process this block for numeric comparisons */
 		/* Make some special values,like Timeticks numeric only if a threshold is defined */
-		if (thlds[i]->warning || thlds[i]->critical || calculate_rate || is_ticks || offset != 0.0 || multiplier != 1.0) {
+		if (thlds[i]->warning || thlds[i]->critical || calculate_rate || is_ticks || offset != 0.0 || multiplier != 1.0 || check_status) {
 			/* Find the first instance of the '(' character - the value of the OID should be contained in parens */
 			if ((ptr = strpbrk(show, "(")) != NULL) { /* Timetick */
 				ptr++;
@@ -853,21 +868,73 @@ main (int argc, char **argv)
 		}
 	}
 	
-	printf ("%s %s -%s %s\n", label, state_text (result), outbuff, perfstr);
-	if (mult_resp) printf ("%s", mult_resp);
-
-	return result;
+/* Handle status mode with proper ifOperStatus checking */
+if (check_status && total_oids > 0) {
+	int if_status = (int)response_value[0];
+	int exit_status = STATE_UNKNOWN;
+	const char *status_msg = "UNKNOWN";
+	char *iface_name = interface_idx;
+	
+	switch (if_status) {
+		case 1:
+			exit_status = STATE_OK;
+			status_msg = "UP";
+			printf("OK - Interface %s is %s", iface_name, status_msg);
+			break;
+		case 2:
+			exit_status = STATE_CRITICAL;
+			status_msg = "DOWN";
+			printf("CRITICAL - Interface %s is %s", iface_name, status_msg);
+			break;
+		case 3:
+			exit_status = STATE_WARNING;
+			status_msg = "TESTING";
+			printf("WARNING - Interface %s is %s", iface_name, status_msg);
+			break;
+		case 4:
+			exit_status = STATE_UNKNOWN;
+			status_msg = "UNKNOWN";
+			printf("UNKNOWN - Interface %s status is %s", iface_name, status_msg);
+			break;
+		case 5:
+			if (dormant_behavior == -1) {
+				exit_status = STATE_OK;
+				printf("OK - Interface %s is DORMANT (ignored)", iface_name);
+			} else {
+				exit_status = dormant_behavior;
+				status_msg = "DORMANT";
+				printf("%s - Interface %s is %s", state_text(exit_status), iface_name, status_msg);
+			}
+			break;
+		case 6:
+			exit_status = STATE_CRITICAL;
+			status_msg = "NOT PRESENT";
+			printf("CRITICAL - Interface %s is %s - possible hotswap in progress", iface_name, status_msg);
+			break;
+		case 7:
+			exit_status = STATE_CRITICAL;
+			status_msg = "LOWER LAYER DOWN";
+			printf("CRITICAL - Interface %s is %s", iface_name, status_msg);
+			break;
+		default:
+			exit_status = STATE_UNKNOWN;
+			printf("UNKNOWN - Interface %s has unexpected status value %d", iface_name, if_status);
+			break;
+	}
+	
+	printf(" | %s=%d\n", oidname, if_status);
+	exit(exit_status);
 }
 
+}
 
-
-/* process command-line arguments */
 int
 process_arguments (int argc, char **argv)
 {
-	char *ptr;
 	int c = 1;
-	int j = 0, jj = 0, ii = 0;
+	int j = 0;
+	int jj = 0, ii = 0;
+	char *ptr = NULL;
 
 	int option = 0;
 	static struct option longopts[] = {
@@ -910,6 +977,9 @@ process_arguments (int argc, char **argv)
 		{"counter-bits", required_argument, 0, L_COUNTER_BITS},
 		{"interface", required_argument, 0, 'i'},
 		{"db-key", required_argument, 0, L_DB_KEY},
+		{"db-path", required_argument, 0, L_DB_PATH},
+		{"dormant", required_argument, 0, L_DORMANT},
+		{"admin-down", required_argument, 0, L_ADMIN_DOWN},
 		{0, 0, 0, 0}
 	};
 
@@ -1165,7 +1235,27 @@ process_arguments (int argc, char **argv)
 			explicit_counter_bits = atoi(optarg);
 			break;
 		case L_DB_KEY:
-			db_key = optarg;
+			db_key_type = optarg;
+			/* Validate db_key_type */
+			if (strcmp(db_key_type, "index") != 0 && strcmp(db_key_type, "name") != 0 &&
+			    strcmp(db_key_type, "alias") != 0 && strcmp(db_key_type, "description") != 0) {
+				die(STATE_UNKNOWN, _("--db-key must be one of: index, name, alias, description\n"));
+			}
+			break;
+		case L_DB_PATH:
+			custom_db_path = optarg;
+			break;
+		case L_DORMANT:
+			if (strcmp(optarg, "i") == 0) dormant_behavior = -1;  /* ignore */
+			else if (strcmp(optarg, "w") == 0) dormant_behavior = STATE_WARNING;
+			else if (strcmp(optarg, "c") == 0) dormant_behavior = STATE_CRITICAL;
+			else die(STATE_UNKNOWN, _("--dormant must be one of: i, w, c\n"));
+			break;
+		case L_ADMIN_DOWN:
+			if (strcmp(optarg, "i") == 0) admin_down_behavior = -1;  /* ignore */
+			else if (strcmp(optarg, "w") == 0) admin_down_behavior = STATE_WARNING;
+			else if (strcmp(optarg, "c") == 0) admin_down_behavior = STATE_CRITICAL;
+			else die(STATE_UNKNOWN, _("--admin-down must be one of: i, w, c\n"));
 			break;
 		case 'i':
 			interface_idx = optarg;
@@ -1186,8 +1276,22 @@ process_arguments (int argc, char **argv)
 	if (community == NULL)
 		community = strdup (DEFAULT_COMMUNITY);
 
+	/* Initialize database path for throughput mode only */
+	if (check_throughput) {
+		db_path = (char *)determine_db_path();
+		
+		/* Initialize database if it doesn't exist */
+		if (db_init(db_path) != STATE_OK) {
+			die(STATE_UNKNOWN, _("Failed to initialize database at %s\n"), db_path);
+		}
+	}
+
+	/* Reject custom OIDs when using --status or --throughput modes */
+	if ((check_status || check_throughput) && numoids > 0)
+		die(STATE_UNKNOWN, _("Custom OIDs (-o) cannot be used with --status or --throughput modes\n"));
+
 	/* Automatically append interface index to OIDs if not already present */
-	if (interface_idx && numoids > 0 && !check_throughput) {
+	if (interface_idx && numoids > 0 && !check_throughput && !check_status) {
 		int i;
 		for (i = 0; i < numoids; i++) {
 			if (oids[i]) {
@@ -1289,31 +1393,19 @@ validate_arguments ()
 	if (server_address == NULL)
 		die(STATE_UNKNOWN, _("No host specified\n"));
 
-	/* Check interface index is given when using throughput mode in auto mode */
-	if (check_throughput && numoids == 0 && interface_idx == NULL)
-		die(STATE_UNKNOWN, _("Interface index (-i) required with --throughput when no -o specified\n"));
+	/* Check interface index is given when using throughput or status mode */
+	if (check_throughput && interface_idx == NULL)
+		die(STATE_UNKNOWN, _("Interface index (-i) required with --throughput\n"));
 
-	/* Extract interface index from OID if not provided */
-	if (check_throughput && numoids > 0 && interface_idx == NULL) {
-		const char *last_dot = strrchr(oids[0], '.');
-		if (last_dot && last_dot[1] != '\0') {
-			interface_idx = strdup(last_dot + 1);
-			if(verbose) printf("Extracted interface index from OID: %s\n", interface_idx);
-		} else {
-			die(STATE_UNKNOWN, _("Could not extract interface index from OID. Specify -i explicitly.\n"));
-		}
-	}
+	if (check_status && interface_idx == NULL)
+		die(STATE_UNKNOWN, _("Interface index (-i) required with --status\n"));
 
-	/* Validate interface index is numeric, units format, and database keys */
+	/* Validate interface index is numeric */
 	if ((check_throughput || check_status) && interface_idx != NULL) {
 		char *endptr;
 		strtol(interface_idx, &endptr, 10);
 		if (*endptr != '\0')
 			die(STATE_UNKNOWN, _("Interface index (-i) must be numeric (e.g., -i 77)\n"));
-		
-		if (db_key == NULL) db_key = interface_idx;
-		if (validate_db_key(db_key) != 0)
-			die(STATE_UNKNOWN, _("Invalid database key '%s'\n"), db_key);
 	}
 
 	if (check_throughput && units != NULL) {
@@ -1582,9 +1674,34 @@ print_help (void)
 	printf ("    %s\n", _("Automatically queries interface octet counters and calculates throughput"));
 	printf (" %s\n", "--counter-bits=BITS");
 	printf ("    %s\n", _("Explicitly specify counter size: 32 or 64 bits"));
-	printf (" %s\n", "--db-key=STRING");
-	printf ("    %s\n", _("Database key for storing throughput data (defaults to interface index)"));
-	printf ("    %s\n", _("Use this to track by port name, description, or alias instead of index"));
+	printf (" %s\n", "--db-key=TYPE");
+	printf ("    %s\n", _("Database key for storing throughput data (defaults to 'index')"));
+	printf ("    %s\n", _("Options: index, name, alias, description"));
+	printf ("    %s\n", _("  index       - Uses the interface index number (default)"));
+	printf ("    %s\n", _("  name        - Uses the interface name (ifName)"));
+	printf ("    %s\n", _("  alias       - Uses the interface alias (ifAlias)"));
+	printf ("    %s\n", _("  description - Uses the interface description (ifDescr)"));
+	printf (" %s\n", "--db-path=PATH");
+	printf ("    %s\n", _("Custom path for SQLite database (directory or full file path)"));
+	printf ("    %s\n", _("Default paths (tried in order): /usr/local/nagios/var,"));
+	printf ("    %s\n", _("  /etc/nagios-mod-gearman, /var/tmp"));
+	printf ("    %s\n", _("Database is automatically created if it doesn't exist"));
+
+	/* Status Monitoring Options */
+	printf ("\n");
+	printf (" %s\n", _("Status Monitoring:"));
+	printf (" %s\n", "-i, --interface=STRING");
+	printf ("    %s\n", _("Interface index/identifier (REQUIRED for --status mode)"));
+	printf (" %s\n", "--status");
+	printf ("    %s\n", _("Enable interface status monitoring mode"));
+	printf ("    %s\n", _("Checks ifOperStatus and reports interface operational state"));
+	printf (" %s\n", "--dormant=i|w|c");
+	printf ("    %s\n", _("Behavior when interface is dormant (default: critical)"));
+	printf ("    %s\n", _("  i = ignore (return OK), w = warning, c = critical"));
+	printf (" %s\n", "--admin-down=i|w|c");
+	printf ("    %s\n", _("Behavior when interface is administratively down (default: warning)"));
+	printf ("    %s\n", _("  i = ignore (return OK), w = warning, c = critical"));
+	printf ("    %s\n", _("Note: Irrelevant options like -u, -w, -c are ignored in status mode"));
 
 	printf (UT_VERBOSE);
 
@@ -1643,6 +1760,19 @@ const char *determine_db_path(void) {
 	const char *db_name = "nagios_snmp_throughput.db";
 	int i;
 	
+	/* Use custom path if provided */
+	if (custom_db_path != NULL) {
+		struct stat st;
+		if (stat(custom_db_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+			snprintf(db_file, sizeof(db_file), "%s/%s", custom_db_path, db_name);
+		} else {
+			snprintf(db_file, sizeof(db_file), "%s", custom_db_path);
+		}
+		if (verbose > 1) printf("DEBUG: Using custom database path: %s\n", db_file);
+		return db_file;
+	}
+	
+	/* Try default paths in order */
 	for (i = 0; i < 3; i++) {
 		if (access(paths[i], W_OK) == 0) {
 			snprintf(db_file, sizeof(db_file), "%s/%s", paths[i], db_name);
@@ -1651,6 +1781,177 @@ const char *determine_db_path(void) {
 		}
 	}
 	return db_file;
+}
+
+int db_init(const char *db_path) {
+	sqlite3 *db;
+	char *err_msg = NULL;
+	int rc;
+	const char *sql_create = 
+		"CREATE TABLE IF NOT EXISTS states ("
+		"host TEXT NOT NULL, "
+		"interface TEXT NOT NULL, "
+		"timestamp INTEGER NOT NULL, "
+		"in_octets INTEGER NOT NULL, "
+		"out_octets INTEGER NOT NULL, "
+		"counter_bits INTEGER NOT NULL, "
+		"PRIMARY KEY (host, interface)"
+		");";
+
+	rc = sqlite3_open(db_path, &db);
+	if (rc != SQLITE_OK) {
+		if (verbose) fprintf(stderr, "Cannot open database: %s\n", sqlite3_errmsg(db));
+		sqlite3_close(db);
+		return STATE_UNKNOWN;
+	}
+
+	rc = sqlite3_exec(db, sql_create, 0, 0, &err_msg);
+	if (rc != SQLITE_OK) {
+		if (verbose) fprintf(stderr, "SQL error: %s\n", err_msg);
+		sqlite3_free(err_msg);
+		sqlite3_close(db);
+		return STATE_UNKNOWN;
+	}
+
+	sqlite3_close(db);
+	
+	if (verbose > 1) printf("DEBUG: Database initialized successfully: %s\n", db_path);
+	return STATE_OK;
+}
+
+char *query_interface_attribute(const char *attr_type, const char *iface_idx, int cmd_interval, int num_retries) {
+	char oid[256];
+	char **cmd_line;
+	output chld_out, chld_err;
+	int return_code;
+	char *result = NULL;
+	char *ptr, *response;
+	int i;
+
+	/* Determine the OID based on attribute type */
+	if (strcmp(attr_type, "description") == 0) {
+		snprintf(oid, sizeof(oid), "1.3.6.1.2.1.2.2.1.2.%s", iface_idx);
+	} else if (strcmp(attr_type, "name") == 0) {
+		snprintf(oid, sizeof(oid), "1.3.6.1.2.1.31.1.1.1.1.%s", iface_idx);
+	} else if (strcmp(attr_type, "alias") == 0) {
+		snprintf(oid, sizeof(oid), "1.3.6.1.2.1.31.1.1.1.18.%s", iface_idx);
+	} else {
+		return NULL;
+	}
+
+	if (verbose > 1) printf("DEBUG: Querying SNMP for %s using OID: %s\n", attr_type, oid);
+
+	/* Build command line for snmpget */
+	cmd_line = calloc(10 + numcontext + numauthpriv + 1 + 1 + 1, sizeof(char *));
+	cmd_line[0] = strdup(PATH_TO_SNMPGET);
+	cmd_line[1] = strdup("-Le");
+	cmd_line[2] = strdup("-t");
+	xasprintf(&cmd_line[3], "%d", cmd_interval);
+	cmd_line[4] = strdup("-r");
+	xasprintf(&cmd_line[5], "%d", num_retries);
+	cmd_line[6] = strdup("-m");
+	cmd_line[7] = strdup("");
+	cmd_line[8] = strdup("-v");
+	cmd_line[9] = strdup(proto ? proto : DEFAULT_PROTOCOL);
+
+	/* Add context args */
+	for (i = 0; i < numcontext; i++) {
+		cmd_line[10 + i] = contextargs[i];
+	}
+
+	/* Add auth/priv args */
+	for (i = 0; i < numauthpriv; i++) {
+		cmd_line[10 + numcontext + i] = authpriv[i];
+	}
+
+	/* Add host:port */
+	xasprintf(&cmd_line[10 + numcontext + numauthpriv], "%s%s:%s", 
+	          ip_version, server_address, port);
+
+	/* Add OID */
+	cmd_line[10 + numcontext + numauthpriv + 1] = strdup(oid);
+	cmd_line[10 + numcontext + numauthpriv + 2] = NULL;
+
+	/* Execute the command */
+	return_code = cmd_run_array(cmd_line, &chld_out, &chld_err, 0);
+
+	/* Check for errors */
+	if (return_code != 0 || chld_out.lines == 0) {
+		if (verbose) {
+			fprintf(stderr, "Failed to query interface %s\n", attr_type);
+			if (chld_err.lines > 0) {
+				fprintf(stderr, "Error: %s\n", chld_err.line[0]);
+			}
+		}
+		goto cleanup;
+	}
+
+	/* Parse the result */
+	ptr = chld_out.line[0];
+	response = strstr(ptr, "=");
+	if (response == NULL) {
+		if (verbose) fprintf(stderr, "No delimiter found in SNMP response\n");
+		goto cleanup;
+	}
+	response += 1;
+
+	/* Skip whitespace and type indicator */
+	while (*response == ' ') response++;
+	if (*response != '\0') {
+		char *colon = strchr(response, ':');
+		if (colon) {
+			response = colon + 1;
+			while (*response == ' ') response++;
+		}
+	}
+
+	/* Remove quotes if present */
+	if (*response == '"') {
+		response++;
+		char *end_quote = strchr(response, '"');
+		if (end_quote) *end_quote = '\0';
+	}
+
+	/* Remove trailing whitespace */
+	char *end = response + strlen(response) - 1;
+	while (end > response && (*end == ' ' || *end == '\n' || *end == '\r')) {
+		*end = '\0';
+		end--;
+	}
+
+	result = strdup(response);
+	if (verbose > 1) printf("DEBUG: Retrieved %s: %s\n", attr_type, result);
+
+cleanup:
+	/* Free command line */
+	for (i = 0; cmd_line[i] != NULL; i++) {
+		free(cmd_line[i]);
+	}
+	free(cmd_line);
+
+	return result;
+}
+
+/* Resolve db_key based on db_key_type */
+void resolve_db_key(int cmd_interval, int num_retries) {
+	if (check_throughput && interface_idx != NULL) {
+		if (db_key_type != NULL) {
+			if (strcmp(db_key_type, "index") == 0) {
+				db_key = interface_idx;
+			} else {
+				db_key = query_interface_attribute(db_key_type, interface_idx, cmd_interval, num_retries);
+				if (db_key == NULL) {
+					die(STATE_UNKNOWN, _("Failed to query interface %s for %s\n"), db_key_type, interface_idx);
+				}
+				if (verbose) printf("Resolved db_key from %s: %s\n", db_key_type, db_key);
+			}
+		} else {
+			db_key = interface_idx;
+		}
+		
+		if (validate_db_key(db_key) != 0)
+			die(STATE_UNKNOWN, _("Invalid database key '%s'\n"), db_key);
+	}
 }
 
 int validate_db_key(const char *key) {
@@ -1773,7 +2074,6 @@ int db_write_state(const char *db_path, const char *host, const char *iface, con
 
 unsigned long long calculate_wraparound(unsigned long long current, unsigned long long previous, int counter_bits) {
     if (current >= previous) return current - previous;
-    /* 64-bit wrap (rare) = reboot/reset, return 0. 32-bit wrap = add max value */
     return (counter_bits == 64) ? 0 : ((0xFFFFFFFFUL - previous) + current + 1);
 }
 
@@ -1789,12 +2089,9 @@ double calculate_throughput(unsigned long long octet_diff, time_t time_diff, con
 double convert_throughput(double value, const char *unit, int to_unit) {
     double divisor = 1.0;
     if (unit) {
-        if (strcmp(unit, "kbps") == 0) divisor = 1000.0;
-        else if (strcmp(unit, "mbps") == 0) divisor = 1000000.0;
-        else if (strcmp(unit, "gbps") == 0) divisor = 1000000000.0;
-        else if (strcmp(unit, "KBps") == 0) divisor = 1000.0;
-        else if (strcmp(unit, "MBps") == 0) divisor = 1000000.0;
-        else if (strcmp(unit, "GBps") == 0) divisor = 1000000000.0;
+        if (strcmp(unit, "kbps") == 0 || strcmp(unit, "KBps") == 0) divisor = 1000.0;
+        else if (strcmp(unit, "mbps") == 0 || strcmp(unit, "MBps") == 0) divisor = 1000000.0;
+        else if (strcmp(unit, "gbps") == 0 || strcmp(unit, "GBps") == 0) divisor = 1000000000.0;
     }
     return to_unit ? (value / divisor) : (value * divisor);
 }
